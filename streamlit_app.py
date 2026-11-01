@@ -4,7 +4,7 @@ import streamlit as st
 st.title("¡Hola Mundo desde Ubuntu! 🐧🚀")
 
 # Mensaje de bienvenida
-st.write("Esta es mi primera aplicación de Streamlit desarrollada localmente en Ubuntu.")
+st.write("Primera aplicación desplegada en Streamlit")
 
 # Componente interactivo
 nombre = st.text_input("Ingresa tu nombre:")
