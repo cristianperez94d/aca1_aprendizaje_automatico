@@ -22,7 +22,7 @@ source .venv/bin/activate
 ```
 
 ```bash
-streamlit run app.py 
+streamlit run streamlit_app.py 
 ```
 
 acceder al siguiente enlace desde el navegador: http://localhost:8501
