@@ -357,6 +357,49 @@ with tab_metrics:
     accuracy_cols[1].metric("Árbol de Decisión · Test", "88,02%")
 
     st.markdown("#### Generalización: entrenamiento frente a prueba")
+    # Gráfico equivalente al comparativo Train vs. Test del notebook.
+    model_names = ["Árbol de Decisión", "Regresión Logística"]
+    train_scores = [0.8991, 0.8860]
+    test_scores = [0.8802, 0.8857]
+    positions = range(len(model_names))
+    bar_width = 0.35
+
+    fig, ax = plt.subplots(figsize=(9, 4.8), dpi=140)
+    train_bars = ax.bar(
+        [position - bar_width / 2 for position in positions],
+        train_scores,
+        bar_width,
+        label="Entrenamiento (Train)",
+        color="#4c72b0",
+    )
+    test_bars = ax.bar(
+        [position + bar_width / 2 for position in positions],
+        test_scores,
+        bar_width,
+        label="Prueba (Test)",
+        color="#55a868",
+    )
+    ax.set_ylabel("Exactitud (Accuracy)")
+    ax.set_title("Exactitud de entrenamiento vs. prueba")
+    ax.set_xticks(list(positions), model_names)
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower right")
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    for bars in (train_bars, test_bars):
+        for bar in bars:
+            ax.annotate(
+                f"{bar.get_height():.2%}",
+                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+    fig.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
+
     generalization = pd.DataFrame(
         {
             "Modelo": ["Regresión Logística", "Árbol de Decisión"],
@@ -382,6 +425,36 @@ with tab_metrics:
         "modelos tienen resultados de prueba cercanos; la logística logra una "
         "exactitud ligeramente mayor y una brecha menor."
     )
+
+    st.markdown("#### Matrices de confusión del conjunto de prueba")
+    st.caption(
+        "Visualizaciones basadas en las matrices calculadas en el notebook. "
+        "Las filas representan la clase real y las columnas la predicción."
+    )
+    confusion_matrices = [
+        ("Árbol de Decisión", [[228, 56], [31, 411]]),
+        ("Regresión Logística", [[238, 46], [37, 405]]),
+    ]
+    confusion_cols = st.columns(2)
+    for column, (model_name, matrix) in zip(confusion_cols, confusion_matrices):
+        with column:
+            fig, ax = plt.subplots(figsize=(5.5, 4.5), dpi=140)
+            sns.heatmap(
+                matrix,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                cbar=False,
+                xticklabels=["Dropout (0)", "Graduate (1)"],
+                yticklabels=["Dropout (0)", "Graduate (1)"],
+                ax=ax,
+            )
+            ax.set_title(f"Matriz de confusión · {model_name}")
+            ax.set_xlabel("Predicción del modelo")
+            ax.set_ylabel("Clase real")
+            fig.tight_layout()
+            st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 
     st.markdown("#### Interpretación de los resultados del notebook")
     analysis_cols = st.columns(2)
