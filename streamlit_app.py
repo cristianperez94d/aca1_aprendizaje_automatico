@@ -412,6 +412,11 @@ with tab_predict:
         "Ingresa las nueve variables utilizadas durante el entrenamiento. "
         "El simulador aplica el modelo seleccionado sin volver a entrenarlo."
     )
+    st.caption(
+        "Rangos permitidos: edad 16–100 años; nota de admisión 0–200; "
+        "asignaturas aprobadas por semestre 0–30; nota del segundo semestre 0–20. "
+        "En los campos binarios, No = 0 y Sí = 1."
+    )
 
     missing_features = []
     if data is not None:
@@ -438,7 +443,7 @@ with tab_predict:
         left_col, right_col = st.columns(2)
         with left_col:
             age = st.number_input(
-                "Edad al matricularse",
+                "Edad al matricularse (16–100 años)",
                 min_value=16,
                 max_value=100,
                 value=20,
@@ -446,7 +451,7 @@ with tab_predict:
                 key="age_at_enrollment",
             )
             admission_grade = st.number_input(
-                "Nota de admisión",
+                "Nota de admisión (0–200)",
                 min_value=0.0,
                 max_value=200.0,
                 value=120.0,
@@ -462,7 +467,7 @@ with tab_predict:
         with right_col:
             scholarship = binary_selector("¿Es becado/a?", "scholarship_holder")
             approved_first = st.number_input(
-                "Asignaturas aprobadas · primer semestre",
+                "Asignaturas aprobadas · primer semestre (0–30)",
                 min_value=0,
                 max_value=30,
                 value=4,
@@ -470,7 +475,7 @@ with tab_predict:
                 key="approved_first_semester",
             )
             approved_second = st.number_input(
-                "Asignaturas aprobadas · segundo semestre",
+                "Asignaturas aprobadas · segundo semestre (0–30)",
                 min_value=0,
                 max_value=30,
                 value=4,
@@ -478,7 +483,7 @@ with tab_predict:
                 key="approved_second_semester",
             )
             second_semester_grade = st.number_input(
-                "Nota promedio · segundo semestre",
+                "Nota promedio · segundo semestre (0–20)",
                 min_value=0.0,
                 max_value=20.0,
                 value=12.0,
