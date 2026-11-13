@@ -1,5 +1,6 @@
 """Aplicación ACA 1: análisis y predicción de deserción estudiantil."""
 
+import json
 import re
 import sqlite3
 import tempfile
@@ -29,6 +30,8 @@ DRIVE_CSV_URL = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}
 LOGISTIC_MODEL_PATH = APP_DIR / "modelo_logistico.pkl"
 TREE_MODEL_PATH = APP_DIR / "modelo_arbol.pkl"
 SCALER_PATH = APP_DIR / "scaler.pkl"
+MLP_MODEL_PATH = APP_DIR / "modelo_mlp.keras"
+MLP_RESULTS_PATH = APP_DIR / "mlp_resultados.json"
 DB_FILENAME = "UCI_Predict_Students_Dropout.db"
 DB_PATH = APP_DIR / DB_FILENAME
 TABLE = "students_dropout_clean"
@@ -52,6 +55,11 @@ MODEL_FILES = {
     "Regresión Logística": LOGISTIC_MODEL_PATH,
     "Árbol de Decisión": TREE_MODEL_PATH,
 }
+MLP_NAME = "Red Neuronal (MLP)"
+# El MLP va primero para que sea el algoritmo seleccionado por defecto
+MODEL_OPTIONS = [MLP_NAME, *MODEL_FILES]
+# Modelos entrenados con datos escalados: requieren scaler.pkl
+SCALED_MODELS = {"Regresión Logística", MLP_NAME}
 
 st.markdown(
     """
@@ -124,6 +132,14 @@ def load_artifacts(
             errors[model_name] = f"No se pudo cargar {model_path.name}: {exc}"
 
     try:
+        # TensorFlow se importa aquí para que la app funcione aunque no esté instalado
+        import keras
+
+        models[MLP_NAME] = keras.models.load_model(MLP_MODEL_PATH, compile=False)
+    except Exception as exc:
+        errors[MLP_NAME] = f"No se pudo cargar {MLP_MODEL_PATH.name}: {exc}"
+
+    try:
         scaler = joblib.load(SCALER_PATH)
     except Exception as exc:
         scaler = None
@@ -132,9 +148,24 @@ def load_artifacts(
     return models, scaler, errors
 
 
+@st.cache_data(show_spinner=False)
+def read_mlp_results(modified_ns: int) -> dict:
+    """Lee los resultados de la red; modified_ns invalida la caché si el archivo cambia."""
+    del modified_ns
+    return json.loads(MLP_RESULTS_PATH.read_text(encoding="utf-8"))
+
+
+def load_mlp_results() -> dict | None:
+    """Devuelve los resultados exportados por el notebook o None si no existen."""
+    try:
+        return read_mlp_results(MLP_RESULTS_PATH.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return None
+
+
 def get_artifact_signature() -> tuple[tuple[str, int | None, int | None], ...]:
     """Genera una clave que cambia si aparece o se modifica algún artefacto."""
-    paths = [*MODEL_FILES.values(), SCALER_PATH]
+    paths = [*MODEL_FILES.values(), MLP_MODEL_PATH, SCALER_PATH]
     signature = []
     for path in paths:
         try:
@@ -153,6 +184,10 @@ def numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
 def validate_feature_schema(estimator: object, artifact_name: str) -> None:
     """Comprueba que el artefacto corresponde al esquema de nueve entradas."""
     feature_count = getattr(estimator, "n_features_in_", None)
+    if feature_count is None:
+        # Los modelos de Keras exponen la forma de entrada en lugar de n_features_in_
+        input_shape = getattr(estimator, "input_shape", None)
+        feature_count = input_shape[-1] if input_shape else None
     if feature_count is not None and feature_count != len(FEATURE_COLUMNS):
         raise ValueError(
             f"{artifact_name} fue entrenado con {feature_count} variables; "
@@ -340,7 +375,7 @@ LIMIT 100
 # -----------------------------------------------------------------------------
 # Barra lateral: proyecto, fuente de datos y estado de los artefactos
 # -----------------------------------------------------------------------------
-st.sidebar.title("🎓 ACA 1 | Aprendizaje Automático")
+st.sidebar.title("🎓 ACA Final | Aprendizaje Automático")
 st.sidebar.markdown(
     "**Proyecto:** Predicción de deserción y éxito académico estudiantil  \n"
     "**Dataset:** UCI Predict Students Dropout"
@@ -356,7 +391,7 @@ st.sidebar.divider()
 
 loaded_models, loaded_scaler, artifact_errors = load_artifacts(get_artifact_signature())
 st.sidebar.subheader("Estado de artefactos")
-for model_name in MODEL_FILES:
+for model_name in MODEL_OPTIONS:
     if model_name in loaded_models:
         st.sidebar.success(f"{model_name}: cargado")
     else:
@@ -368,7 +403,8 @@ else:
 
 selected_model_name = st.sidebar.selectbox(
     "Algoritmo predictivo",
-    options=list(MODEL_FILES),
+    options=MODEL_OPTIONS,
+    index=0,
 )
 
 try:
@@ -396,10 +432,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_eda, tab_metrics, tab_predict, tab_sql = st.tabs(
+tab_eda, tab_metrics, tab_nn, tab_predict, tab_sql = st.tabs(
     [
         "📊 Análisis exploratorio",
         "📈 Evaluación de modelos",
+        "🧠 Red neuronal",
         "🔮 Simulador predictivo",
         "🗄️ Consultas SQL",
     ]
@@ -509,26 +546,51 @@ with tab_metrics:
     st.subheader("Evaluación y comparación de modelos")
     st.info(
         "Estos resultados corresponden al reentrenamiento del notebook con las nueve "
-        "variables predictoras usadas por el simulador. Se excluyeron los casos "
+        "variables predictoras usadas por el simulador, e incluyen la red neuronal (MLP). "
+        "Se excluyeron los casos "
         "Enrolled y se conservó la partición estratificada 80/20 con `random_state=42`. "
         "Las métricas de esta pestaña son fijas y no dependen de las entradas del usuario."
     )
 
+    def pct_es(value: float) -> str:
+        """Formatea una proporción como porcentaje con coma decimal."""
+        return f"{value * 100:.2f} %".replace(".", ",")
+
+    model_results = {
+        "Árbol de Decisión": {"train": 0.8991, "test": 0.8802, "matrix": [[228, 56], [31, 411]]},
+        "Regresión Logística": {"train": 0.8860, "test": 0.8857, "matrix": [[238, 46], [37, 405]]},
+    }
+    mlp_eval = load_mlp_results()
+    if mlp_eval is not None:
+        model_results[MLP_NAME] = {
+            "train": mlp_eval["exactitud"]["train"],
+            "test": mlp_eval["exactitud"]["test"],
+            "matrix": mlp_eval["matriz_confusion"],
+        }
+    else:
+        st.warning(
+            "No se encontró `mlp_resultados.json`; se comparan solo los modelos clásicos. "
+            "Ejecuta la celda de exportación del notebook para incluir la red neuronal."
+        )
+
+    ranking = sorted(model_results.items(), key=lambda item: item[1]["test"], reverse=True)
+    best_name, best_result = ranking[0]
+    others_text = ", ".join(f"{name} **{pct_es(result['test'])}**" for name, result in ranking[1:])
+    test_students = sum(sum(row) for row in model_results["Árbol de Decisión"]["matrix"])
     st.markdown(
         "#### Exactitud en el conjunto de prueba\n"
-        "La Regresión Logística obtuvo **88,57 %** y el Árbol de Decisión **88,02 %** "
-        "sobre 726 estudiantes. La diferencia es de **0,55 puntos porcentuales** a "
-        "favor de la Regresión Logística."
+        f"Sobre {test_students} estudiantes, el mejor resultado lo obtuvo **{best_name}** con "
+        f"**{pct_es(best_result['test'])}**, frente a {others_text}."
     )
-    accuracy_cols = st.columns(2)
-    accuracy_cols[0].metric("Regresión Logística · Test", "88,57%")
-    accuracy_cols[1].metric("Árbol de Decisión · Test", "88,02%")
+    accuracy_cols = st.columns(len(model_results))
+    for column, (name, result) in zip(accuracy_cols, model_results.items()):
+        column.metric(f"{name} · Test", pct_es(result["test"]).replace(" %", "%"))
 
     st.markdown("#### Generalización: entrenamiento frente a prueba")
     # Gráfico equivalente al comparativo Train vs. Test del notebook.
-    model_names = ["Árbol de Decisión", "Regresión Logística"]
-    train_scores = [0.8991, 0.8860]
-    test_scores = [0.8802, 0.8857]
+    model_names = list(model_results)
+    train_scores = [model_results[name]["train"] for name in model_names]
+    test_scores = [model_results[name]["test"] for name in model_names]
     positions = range(len(model_names))
     bar_width = 0.35
 
@@ -570,10 +632,12 @@ with tab_metrics:
 
     generalization = pd.DataFrame(
         {
-            "Modelo": ["Regresión Logística", "Árbol de Decisión"],
-            "Entrenamiento": [0.8860, 0.8991],
-            "Prueba": [0.8857, 0.8802],
-            "Brecha (puntos porcentuales)": [0.03, 1.89],
+            "Modelo": model_names,
+            "Entrenamiento": train_scores,
+            "Prueba": test_scores,
+            "Brecha (puntos porcentuales)": [
+                (train - test) * 100 for train, test in zip(train_scores, test_scores)
+            ],
         }
     )
     st.dataframe(
@@ -587,11 +651,14 @@ with tab_metrics:
         hide_index=True,
         use_container_width=True,
     )
+    gaps_text = ", ".join(
+        f"{name} {(result['train'] - result['test']) * 100:.2f} pp".replace(".", ",")
+        for name, result in model_results.items()
+    )
     st.markdown(
-        "La Regresión Logística presenta una brecha Train/Test de aproximadamente "
-        "0,03 pp, mientras que la del Árbol es de 1,89 pp. En esta partición, ambos "
-        "modelos tienen resultados de prueba cercanos; la logística logra una "
-        "exactitud ligeramente mayor y una brecha menor."
+        f"Brecha entre entrenamiento y prueba: {gaps_text}. Una brecha cercana a 0 "
+        "indica que el modelo funciona casi igual con estudiantes que no vio al "
+        "aprender; en esta partición ninguno muestra un sobreajuste marcado."
     )
 
     st.markdown("#### Matrices de confusión del conjunto de prueba")
@@ -599,11 +666,8 @@ with tab_metrics:
         "Visualizaciones basadas en las matrices calculadas en el notebook. "
         "Las filas representan la clase real y las columnas la predicción."
     )
-    confusion_matrices = [
-        ("Árbol de Decisión", [[228, 56], [31, 411]]),
-        ("Regresión Logística", [[238, 46], [37, 405]]),
-    ]
-    confusion_cols = st.columns(2)
+    confusion_matrices = [(name, result["matrix"]) for name, result in model_results.items()]
+    confusion_cols = st.columns(len(confusion_matrices))
     for column, (model_name, matrix) in zip(confusion_cols, confusion_matrices):
         with column:
             fig, ax = plt.subplots(figsize=(5.5, 4.5), dpi=140)
@@ -624,8 +688,45 @@ with tab_metrics:
             st.pyplot(fig, clear_figure=True)
             plt.close(fig)
 
+    st.markdown("#### Comparativa de detección por clase")
+    comparison_rows = []
+    for name, result in model_results.items():
+        (dropout_ok, dropout_missed), (graduate_missed, graduate_ok) = result["matrix"]
+        precision_dropout = dropout_ok / (dropout_ok + graduate_missed)
+        recall_dropout = dropout_ok / (dropout_ok + dropout_missed)
+        precision_graduate = graduate_ok / (graduate_ok + dropout_missed)
+        recall_graduate = graduate_ok / (graduate_ok + graduate_missed)
+        f1_dropout = 2 * precision_dropout * recall_dropout / (precision_dropout + recall_dropout)
+        f1_graduate = 2 * precision_graduate * recall_graduate / (precision_graduate + recall_graduate)
+        comparison_rows.append(
+            {
+                "Modelo": name,
+                "Desertores detectados": f"{dropout_ok} de {dropout_ok + dropout_missed}",
+                "Precisión (Dropout)": precision_dropout,
+                "Sensibilidad (Dropout)": recall_dropout,
+                "Sensibilidad (Graduate)": recall_graduate,
+                "F1-Score (promedio)": (f1_dropout + f1_graduate) / 2,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(comparison_rows).style.format(
+            {
+                "Precisión (Dropout)": "{:.2f}",
+                "Sensibilidad (Dropout)": "{:.2f}",
+                "Sensibilidad (Graduate)": "{:.2f}",
+                "F1-Score (promedio)": "{:.2f}",
+            }
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "La sensibilidad de Dropout indica qué parte de los desertores reales detecta "
+        "cada modelo; es la métrica más importante para ofrecer ayuda a tiempo."
+    )
+
     st.markdown("#### Interpretación de los resultados del notebook")
-    analysis_cols = st.columns(2)
+    analysis_cols = st.columns(3 if mlp_eval is not None else 2)
     with analysis_cols[0]:
         st.markdown(
             "**Detección de deserción:** la Regresión Logística identificó "
@@ -642,6 +743,163 @@ with tab_metrics:
             "graduados más, mientras que la logística detectó ocho casos de deserción "
             "adicionales y obtuvo una exactitud global ligeramente mayor."
         )
+    if mlp_eval is not None:
+        mlp_matrix = model_results[MLP_NAME]["matrix"]
+        logistic_matrix = model_results["Regresión Logística"]["matrix"]
+        with analysis_cols[2]:
+            st.markdown(
+                f"**Red neuronal:** su exactitud global fue "
+                f"{pct_es(model_results[MLP_NAME]['test'])}. Detectó a {mlp_matrix[0][0]} de "
+                f"{sum(mlp_matrix[0])} desertores (la Regresión Logística, {logistic_matrix[0][0]}) "
+                f"y clasificó bien a {mlp_matrix[1][1]} de {sum(mlp_matrix[1])} graduados "
+                f"(la Regresión Logística, {logistic_matrix[1][1]}). La comparación "
+                "proviene de una sola partición de datos y puede variar al reentrenar."
+            )
+
+
+# -----------------------------------------------------------------------------
+# Pestaña: gráficos y métricas de la red neuronal (resultados exportados por el notebook)
+# -----------------------------------------------------------------------------
+with tab_nn:
+    st.subheader("Red neuronal (Perceptrón Multicapa)")
+    st.write(
+        "La red neuronal es un modelo que aprende patrones combinando las nueve "
+        "variables del estudiante. Aquí se muestra cómo aprendió y qué tan bien "
+        "acierta con estudiantes que no vio durante el entrenamiento."
+    )
+    with st.expander("¿Cómo está construida la red?"):
+        st.markdown(
+            "| Capa | Detalle |\n|---|---|\n"
+            "| Entrada | 9 neuronas, una por variable del formulario |\n"
+            "| Oculta 1 | 32 neuronas, activación ReLU y Dropout 0,2 |\n"
+            "| Oculta 2 | 16 neuronas, activación ReLU y Dropout 0,2 |\n"
+            "| Salida | 2 neuronas con Softmax: probabilidad de Dropout y de Graduate |\n\n"
+            "El *Dropout* apaga al azar algunas neuronas durante el aprendizaje para "
+            "que la red no memorice a los estudiantes."
+        )
+
+    mlp_results = load_mlp_results()
+    if mlp_results is None:
+        st.info(
+            "No se encontró `mlp_resultados.json`. Ejecuta la celda de exportación del "
+            "notebook para generarlo junto a `streamlit_app.py`."
+        )
+    else:
+        try:
+            history = mlp_results["historial"]
+            best_epoch = int(mlp_results["epoca_convergencia"])
+            matrix = mlp_results["matriz_confusion"]
+            class_metrics = mlp_results["metricas"]
+            macro = class_metrics["Promedio macro"]
+            accuracy_test = mlp_results["exactitud"]["test"]
+            accuracy_train = mlp_results["exactitud"]["train"]
+            epochs = list(range(1, len(history["loss"]) + 1))
+
+            summary_cols = st.columns(4)
+            summary_cols[0].metric("Exactitud (prueba)", f"{accuracy_test:.2%}")
+            summary_cols[1].metric("Precisión (promedio)", f"{macro['precision']:.2f}")
+            summary_cols[2].metric("Sensibilidad (promedio)", f"{macro['recall']:.2f}")
+            summary_cols[3].metric("F1-Score (promedio)", f"{macro['f1']:.2f}")
+
+            st.markdown("#### 1. ¿Cómo aprendió la red?")
+            curve_cols = st.columns(2)
+            for column, (train_key, val_key, title, y_label) in zip(
+                curve_cols,
+                [
+                    ("loss", "val_loss", "Pérdida por época", "Pérdida (error)"),
+                    ("accuracy", "val_accuracy", "Exactitud por época", "Exactitud"),
+                ],
+            ):
+                with column:
+                    fig, ax = plt.subplots(figsize=(6.5, 4.2), dpi=140)
+                    ax.plot(epochs, history[train_key], label="Entrenamiento")
+                    ax.plot(epochs, history[val_key], label="Validación")
+                    ax.axvline(
+                        best_epoch,
+                        color="gray",
+                        linestyle="--",
+                        label=f"Convergencia (época {best_epoch})",
+                    )
+                    ax.set_title(title)
+                    ax.set_xlabel("Época")
+                    ax.set_ylabel(y_label)
+                    ax.legend()
+                    fig.tight_layout()
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+            st.markdown(
+                f"La pérdida mide cuánto se equivoca la red y debe bajar mientras aprende. "
+                f"La línea punteada marca la **época {best_epoch}**, cuando dejó de mejorar con "
+                f"estudiantes que no usa para aprender; el entrenamiento se detuvo solo en la "
+                f"época {mlp_results['epocas_entrenadas']}. Como las líneas de entrenamiento y "
+                f"validación van juntas, la red **aprendió patrones generales y no memorizó** "
+                f"a los estudiantes (exactitud de entrenamiento {accuracy_train:.2%} frente "
+                f"a {accuracy_test:.2%} en prueba)."
+            )
+
+            st.markdown("#### 2. ¿En qué acierta y en qué se equivoca?")
+            result_cols = st.columns(2)
+            with result_cols[0]:
+                fig, ax = plt.subplots(figsize=(5.5, 4.5), dpi=140)
+                sns.heatmap(
+                    matrix,
+                    annot=True,
+                    fmt="d",
+                    cmap="Blues",
+                    cbar=False,
+                    xticklabels=["Dropout (0)", "Graduate (1)"],
+                    yticklabels=["Dropout (0)", "Graduate (1)"],
+                    ax=ax,
+                )
+                ax.set_title("Matriz de confusión · Red neuronal")
+                ax.set_xlabel("Predicción de la red")
+                ax.set_ylabel("Lo que realmente pasó")
+                fig.tight_layout()
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+            with result_cols[1]:
+                metrics_table = pd.DataFrame(class_metrics).T.rename(
+                    columns={
+                        "precision": "Precisión",
+                        "recall": "Sensibilidad (Recall)",
+                        "f1": "F1-Score",
+                        "soporte": "Estudiantes",
+                    }
+                )
+                st.dataframe(
+                    metrics_table.style.format(
+                        {
+                            "Precisión": "{:.2f}",
+                            "Sensibilidad (Recall)": "{:.2f}",
+                            "F1-Score": "{:.2f}",
+                            "Estudiantes": "{:.0f}",
+                        }
+                    ),
+                    width="stretch",
+                )
+                st.markdown(
+                    "- **Exactitud:** de cada 100 estudiantes, cuántos clasifica bien.\n"
+                    "- **Precisión:** cuando la red dice «desertará», qué tan seguido acierta.\n"
+                    "- **Sensibilidad:** de los que realmente desertaron, cuántos detecta. "
+                    "Es la clave, porque un desertor no detectado no recibe ayuda.\n"
+                    "- **F1-Score:** resume precisión y sensibilidad en un solo número."
+                )
+
+            dropouts_total = sum(matrix[0])
+            graduates_total = sum(matrix[1])
+            st.markdown("#### 3. Conclusión")
+            st.markdown(
+                f"De {dropouts_total} estudiantes que desertaron, la red **detectó a "
+                f"{matrix[0][0]} y no detectó a {matrix[0][1]}**. De {graduates_total} que "
+                f"se graduaron, clasificó bien a {matrix[1][1]} y marcó en riesgo a "
+                f"{matrix[1][0]} por error. Sirve como apoyo para decidir a quién acompañar de "
+                "forma temprana, no como veredicto definitivo sobre un estudiante."
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            st.error(
+                "El archivo `mlp_resultados.json` no tiene el formato esperado. "
+                f"Vuelve a ejecutar la celda de exportación del notebook. Detalle: {exc}"
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -674,9 +932,10 @@ with tab_predict:
         st.error(artifact_errors.get(selected_model_name, "El modelo seleccionado no está disponible."))
         st.info(
             "Ejecuta la celda de exportación del notebook para guardar "
-            "`modelo_logistico.pkl` y `modelo_arbol.pkl` junto a `streamlit_app.py`."
+            "`modelo_logistico.pkl`, `modelo_arbol.pkl` y `modelo_mlp.keras` junto a "
+            "`streamlit_app.py`. La red neuronal también requiere `tensorflow`."
         )
-    if selected_model_name == "Regresión Logística" and loaded_scaler is None:
+    if selected_model_name in SCALED_MODELS and loaded_scaler is None:
         st.error(artifact_errors.get("scaler", "El escalador no está disponible."))
         st.info("Guarda el StandardScaler entrenado en `scaler.pkl` desde el notebook.")
 
@@ -752,18 +1011,25 @@ with tab_predict:
         model = loaded_models.get(selected_model_name)
         if model is None:
             st.error("No se puede predecir: el modelo seleccionado no se cargó.")
-        elif selected_model_name == "Regresión Logística" and loaded_scaler is None:
-            st.error("No se puede predecir: falta el escalador de la Regresión Logística.")
+        elif selected_model_name in SCALED_MODELS and loaded_scaler is None:
+            st.error("No se puede predecir: falta el escalador del modelo seleccionado.")
         else:
             try:
                 validate_feature_schema(model, selected_model_name)
-                if selected_model_name == "Regresión Logística":
+                if selected_model_name in SCALED_MODELS:
                     validate_feature_schema(loaded_scaler, "scaler.pkl")
                     prediction_input = loaded_scaler.transform(input_frame)
                 else:
                     prediction_input = input_frame
 
-                predicted_class = int(model.predict(prediction_input)[0])
+                graduate_probability = None
+                if selected_model_name == MLP_NAME:
+                    # Softmax: la posición 0 es Dropout y la 1 es Graduate
+                    probabilities = model.predict(prediction_input, verbose=0)[0]
+                    predicted_class = int(probabilities.argmax())
+                    graduate_probability = float(probabilities[1])
+                else:
+                    predicted_class = int(model.predict(prediction_input)[0])
                 predicted_label = TARGET_LABELS.get(predicted_class)
                 if predicted_label is None:
                     raise ValueError(f"El modelo devolvió una clase inesperada: {predicted_class}.")
@@ -783,7 +1049,7 @@ with tab_predict:
                         "académica."
                     )
 
-                if hasattr(model, "predict_proba"):
+                if graduate_probability is None and hasattr(model, "predict_proba"):
                     probabilities = model.predict_proba(prediction_input)[0]
                     classes = list(model.classes_)
                     graduate_probability = next(
@@ -794,15 +1060,15 @@ with tab_predict:
                         ),
                         None,
                     )
-                    if graduate_probability is not None:
-                        st.metric(
-                            "Probabilidad estimada de graduación",
-                            f"{graduate_probability:.1%}",
-                        )
-                        st.caption(
-                            "Probabilidad estimada por el modelo; no es una garantía "
-                            "del resultado individual."
-                        )
+                if graduate_probability is not None:
+                    st.metric(
+                        "Probabilidad estimada de graduación",
+                        f"{graduate_probability:.1%}",
+                    )
+                    st.caption(
+                        "Probabilidad estimada por el modelo; no es una garantía "
+                        "del resultado individual."
+                    )
             except Exception as exc:
                 st.error(
                     "No fue posible generar la predicción. Verifica que los modelos "
