@@ -1,5 +1,10 @@
 """Aplicación ACA 1: análisis y predicción de deserción estudiantil."""
 
+import re
+import sqlite3
+import tempfile
+import time
+from contextlib import closing
 from pathlib import Path
 
 import joblib
@@ -24,6 +29,11 @@ DRIVE_CSV_URL = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}
 LOGISTIC_MODEL_PATH = APP_DIR / "modelo_logistico.pkl"
 TREE_MODEL_PATH = APP_DIR / "modelo_arbol.pkl"
 SCALER_PATH = APP_DIR / "scaler.pkl"
+DB_FILENAME = "UCI_Predict_Students_Dropout.db"
+DB_PATH = APP_DIR / DB_FILENAME
+TABLE = "students_dropout_clean"
+EDITOR_MAX_ROWS = 1000
+QUERY_TIMEOUT_SECONDS = 5
 
 FEATURE_COLUMNS = [
     "Age at enrollment",
@@ -171,6 +181,163 @@ def binary_selector(label: str, key: str) -> int:
 
 
 # -----------------------------------------------------------------------------
+# SQLite: base limpia del notebook (o reconstruida desde el dataset si no existe)
+# -----------------------------------------------------------------------------
+def open_readonly(db_path: str | Path) -> sqlite3.Connection:
+    """Abre la base en modo solo lectura para que ninguna consulta pueda modificarla."""
+    conn = sqlite3.connect(f"{Path(db_path).as_uri()}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def database_is_valid(db_path: Path) -> bool:
+    """Comprueba que el archivo tenga la tabla limpia con las columnas esperadas."""
+    if not db_path.is_file():
+        return False
+    try:
+        with closing(open_readonly(db_path)) as conn:
+            columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{TABLE}")')}
+            return {"Target_Binario", *FEATURE_COLUMNS} <= columns
+    except sqlite3.Error:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_database(_frame: pd.DataFrame | None) -> tuple[str, str]:
+    """Devuelve la ruta de la base SQLite y su origen; la reconstruye si falta el archivo."""
+    if database_is_valid(DB_PATH):
+        return str(DB_PATH), f"Archivo {DB_FILENAME} generado por el notebook"
+    if _frame is None:
+        raise RuntimeError(
+            f"No existe {DB_FILENAME} y tampoco fue posible cargar el dataset para crearla."
+        )
+
+    clean = _frame.copy()
+    clean["Target"] = clean["Target"].astype(str)
+    clean["Target_Binario"] = (clean["Target"] == "Graduate").astype(int)
+    rebuilt_path = Path(tempfile.gettempdir()) / DB_FILENAME
+    with closing(sqlite3.connect(rebuilt_path)) as conn:
+        clean.to_sql(TABLE, conn, if_exists="replace", index=False)
+    return str(rebuilt_path), "Base reconstruida en tiempo de ejecución desde el dataset limpio"
+
+
+@st.cache_data(show_spinner=False)
+def run_query(
+    db_path: str, sql: str, params: tuple = (), max_rows: int = 10_000
+) -> tuple[pd.DataFrame, bool]:
+    """Ejecuta una consulta de lectura con tiempo y filas limitados."""
+    deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
+    with closing(open_readonly(db_path)) as conn:
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 100_000)
+        cursor = conn.execute(sql, params)
+        columns = [column[0] for column in cursor.description]
+        rows = cursor.fetchmany(max_rows + 1)
+    return pd.DataFrame(rows[:max_rows], columns=columns), len(rows) > max_rows
+
+
+def validate_read_only_sql(sql: str) -> str:
+    """Acepta únicamente una sentencia SELECT o WITH."""
+    statement = sql.strip().rstrip(";").strip()
+    if not re.match(r"(?is)^(select|with)\b", statement):
+        raise ValueError("Solo se permiten consultas SELECT o WITH.")
+    if ";" in statement:
+        raise ValueError("Ejecuta una sola sentencia por consulta.")
+    return statement
+
+
+QUICK_METRICS_SQL = f"""
+SELECT
+    COUNT(*) AS total,
+    SUM(Target_Binario) AS graduados,
+    COUNT(*) - SUM(Target_Binario) AS desertores,
+    ROUND(100.0 * (COUNT(*) - SUM(Target_Binario)) / COUNT(*), 2) AS tasa_desercion,
+    ROUND(AVG("Age at enrollment"), 1) AS edad_promedio,
+    ROUND(AVG("Curricular units 2nd sem (grade)"), 2) AS nota_promedio_2s,
+    ROUND(100.0 * AVG("Scholarship holder"), 1) AS pct_becarios,
+    ROUND(100.0 * AVG("Debtor"), 1) AS pct_deudores
+FROM {TABLE}
+""".strip()
+
+RISK_FACTORS_SQL = f"""
+SELECT 'Becario: ' || CASE WHEN "Scholarship holder" = 1 THEN 'Sí' ELSE 'No' END AS grupo,
+       COUNT(*) AS estudiantes,
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1) AS tasa_desercion
+FROM {TABLE} GROUP BY 1
+UNION ALL
+SELECT 'Deudor: ' || CASE WHEN "Debtor" = 1 THEN 'Sí' ELSE 'No' END,
+       COUNT(*),
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1)
+FROM {TABLE} GROUP BY 1
+UNION ALL
+SELECT 'Matrícula al día: ' || CASE WHEN "Tuition fees up to date" = 1 THEN 'Sí' ELSE 'No' END,
+       COUNT(*),
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1)
+FROM {TABLE} GROUP BY 1
+""".strip()
+
+EXAMPLE_QUERIES = {
+    "Deserción por grupo de edad": f"""
+SELECT CASE
+           WHEN "Age at enrollment" <= 20 THEN '18-20'
+           WHEN "Age at enrollment" <= 23 THEN '21-23'
+           WHEN "Age at enrollment" <= 26 THEN '24-26'
+           WHEN "Age at enrollment" <= 30 THEN '27-30'
+           ELSE '31+'
+       END AS grupo_edad,
+       COUNT(*) AS estudiantes,
+       SUM(1 - Target_Binario) AS desertores,
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1) AS tasa_desercion
+FROM {TABLE}
+GROUP BY grupo_edad
+ORDER BY MIN("Age at enrollment")
+""".strip(),
+    "Cursos con mayor deserción (mín. 30 estudiantes)": f"""
+SELECT Course AS curso,
+       COUNT(*) AS estudiantes,
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1) AS tasa_desercion,
+       ROUND(AVG("Curricular units 2nd sem (grade)"), 2) AS nota_promedio_2s
+FROM {TABLE}
+GROUP BY Course
+HAVING COUNT(*) >= 30
+ORDER BY tasa_desercion DESC
+LIMIT 10
+""".strip(),
+    "Perfil financiero y riesgo": f"""
+SELECT "Debtor" AS deudor,
+       "Tuition fees up to date" AS matricula_al_dia,
+       "Scholarship holder" AS becario,
+       COUNT(*) AS estudiantes,
+       ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1) AS tasa_desercion
+FROM {TABLE}
+GROUP BY 1, 2, 3
+ORDER BY tasa_desercion DESC
+""".strip(),
+    "Rendimiento académico por estado final": f"""
+SELECT Target AS estado_final,
+       COUNT(*) AS estudiantes,
+       ROUND(AVG("Curricular units 1st sem (approved)"), 2) AS aprobadas_1s,
+       ROUND(AVG("Curricular units 2nd sem (approved)"), 2) AS aprobadas_2s,
+       ROUND(AVG("Curricular units 2nd sem (grade)"), 2) AS nota_promedio_2s,
+       ROUND(AVG("Admission grade"), 1) AS nota_admision
+FROM {TABLE}
+GROUP BY Target
+""".strip(),
+    "Nota frente al promedio de su curso (función de ventana)": f"""
+SELECT Course AS curso,
+       Target AS estado_final,
+       "Curricular units 2nd sem (grade)" AS nota_2s,
+       ROUND(AVG("Curricular units 2nd sem (grade)") OVER (PARTITION BY Course), 2) AS promedio_curso,
+       RANK() OVER (
+           PARTITION BY Course ORDER BY "Curricular units 2nd sem (grade)" ASC
+       ) AS posicion_desde_la_nota_mas_baja
+FROM {TABLE}
+ORDER BY curso, posicion_desde_la_nota_mas_baja
+LIMIT 100
+""".strip(),
+}
+
+
+# -----------------------------------------------------------------------------
 # Barra lateral: proyecto, fuente de datos y estado de los artefactos
 # -----------------------------------------------------------------------------
 st.sidebar.title("🎓 ACA 1 | Aprendizaje Automático")
@@ -229,11 +396,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_eda, tab_metrics, tab_predict = st.tabs(
+tab_eda, tab_metrics, tab_predict, tab_sql = st.tabs(
     [
         "📊 Análisis exploratorio",
         "📈 Evaluación de modelos",
         "🔮 Simulador predictivo",
+        "🗄️ Consultas SQL",
     ]
 )
 
@@ -641,5 +809,165 @@ with tab_predict:
                     "y el escalador se hayan entrenado con las nueve variables, "
                     f"en el orden indicado. Detalle: {exc}"
                 )
+
+
+# -----------------------------------------------------------------------------
+# Pestaña 4: métricas y consultas SQL sobre la base SQLite limpia
+# -----------------------------------------------------------------------------
+with tab_sql:
+    st.subheader("Consultas SQL sobre la base de datos limpia")
+
+    try:
+        db_path, db_source = ensure_database(data)
+    except Exception as exc:
+        db_path = None
+        st.error(f"No fue posible preparar la base SQLite. Detalle: {exc}")
+
+    if db_path is not None:
+        st.caption(f"{db_source} · tabla `{TABLE}` · acceso de solo lectura.")
+        sql_metrics_tab, sql_advanced_tab = st.tabs(
+            ["⚡ Métricas rápidas", "🔎 Consultas avanzadas e interactivas"]
+        )
+
+        # --- Métricas rápidas calculadas con SQL ---------------------------------
+        with sql_metrics_tab:
+            try:
+                summary, _ = run_query(db_path, QUICK_METRICS_SQL)
+                row = summary.iloc[0]
+                top_cols = st.columns(4)
+                top_cols[0].metric("Estudiantes", f"{int(row['total']):,}")
+                top_cols[1].metric("Graduados", f"{int(row['graduados']):,}")
+                top_cols[2].metric("Desertores", f"{int(row['desertores']):,}")
+                top_cols[3].metric("Tasa de deserción", f"{row['tasa_desercion']:.2f}%")
+                bottom_cols = st.columns(4)
+                bottom_cols[0].metric("Edad promedio", f"{row['edad_promedio']:.1f}")
+                bottom_cols[1].metric("Nota promedio 2.º sem.", f"{row['nota_promedio_2s']:.2f}")
+                bottom_cols[2].metric("Becarios", f"{row['pct_becarios']:.1f}%")
+                bottom_cols[3].metric("Con deuda", f"{row['pct_deudores']:.1f}%")
+                with st.expander("Ver consulta SQL de las métricas"):
+                    st.code(QUICK_METRICS_SQL, language="sql")
+
+                st.markdown("#### Tasa de deserción por factor")
+                factors, _ = run_query(db_path, RISK_FACTORS_SQL)
+                st.bar_chart(factors.set_index("grupo")["tasa_desercion"], horizontal=True)
+                st.dataframe(
+                    factors.rename(
+                        columns={
+                            "grupo": "Grupo",
+                            "estudiantes": "Estudiantes",
+                            "tasa_desercion": "Tasa de deserción (%)",
+                        }
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+                with st.expander("Ver consulta SQL de los factores"):
+                    st.code(RISK_FACTORS_SQL, language="sql")
+            except Exception as exc:
+                st.error(f"No fue posible calcular las métricas con SQL. Detalle: {exc}")
+
+        # --- Consultas avanzadas e interactivas ----------------------------------
+        with sql_advanced_tab:
+            st.markdown("#### 1. Explorador con filtros")
+            st.caption("Los filtros se envían como parámetros enlazados a la consulta SQL.")
+            try:
+                bounds, _ = run_query(
+                    db_path,
+                    'SELECT MIN("Age at enrollment") AS min_age, '
+                    f'MAX("Age at enrollment") AS max_age FROM {TABLE}',
+                )
+                min_age, max_age = int(bounds.at[0, "min_age"]), int(bounds.at[0, "max_age"])
+
+                filter_cols = st.columns(3)
+                with filter_cols[0]:
+                    age_range = st.slider("Edad al matricularse", min_age, max_age, (min_age, max_age))
+                    grade_range = st.slider("Nota 2.º semestre", 0.0, 20.0, (0.0, 20.0), step=0.5)
+                with filter_cols[1]:
+                    status_filter = st.selectbox("Estado final", ["Todos", "Dropout", "Graduate"])
+                    scholarship_filter = st.selectbox("Becario", ["Todos", "Sí", "No"])
+                with filter_cols[2]:
+                    debtor_filter = st.selectbox("Deudor", ["Todos", "Sí", "No"])
+                    tuition_filter = st.selectbox("Matrícula al día", ["Todos", "Sí", "No"])
+
+                conditions = [
+                    '"Age at enrollment" BETWEEN ? AND ?',
+                    '"Curricular units 2nd sem (grade)" BETWEEN ? AND ?',
+                ]
+                params: list = [age_range[0], age_range[1], grade_range[0], grade_range[1]]
+                if status_filter != "Todos":
+                    conditions.append("Target_Binario = ?")
+                    params.append(1 if status_filter == "Graduate" else 0)
+                for choice, column in (
+                    (scholarship_filter, "Scholarship holder"),
+                    (debtor_filter, "Debtor"),
+                    (tuition_filter, "Tuition fees up to date"),
+                ):
+                    if choice != "Todos":
+                        conditions.append(f'"{column}" = ?')
+                        params.append(1 if choice == "Sí" else 0)
+                where_sql = " AND ".join(conditions)
+
+                count_sql = (
+                    "SELECT COUNT(*) AS total, "
+                    "ROUND(100.0 * SUM(1 - Target_Binario) / COUNT(*), 1) AS tasa_desercion, "
+                    'ROUND(AVG("Admission grade"), 1) AS nota_admision '
+                    f"FROM {TABLE} WHERE {where_sql}"
+                )
+                counts, _ = run_query(db_path, count_sql, tuple(params))
+                total_found = int(counts.at[0, "total"])
+                result_cols = st.columns(3)
+                result_cols[0].metric("Estudiantes encontrados", f"{total_found:,}")
+                if total_found:
+                    result_cols[1].metric("Tasa de deserción", f"{counts.at[0, 'tasa_desercion']:.1f}%")
+                    result_cols[2].metric("Nota de admisión promedio", f"{counts.at[0, 'nota_admision']:.1f}")
+
+                select_columns = ", ".join(f'"{column}"' for column in FEATURE_COLUMNS)
+                detail_sql = (
+                    f"SELECT {select_columns}, Target FROM {TABLE} "
+                    f"WHERE {where_sql} LIMIT {EDITOR_MAX_ROWS}"
+                )
+                detail, _ = run_query(db_path, detail_sql, tuple(params))
+                with st.expander("Ver consulta SQL generada"):
+                    st.code(detail_sql, language="sql")
+                    st.caption(f"Parámetros: {params}")
+                st.dataframe(detail, hide_index=True, width="stretch")
+                st.download_button(
+                    "Descargar resultado (CSV)",
+                    detail.to_csv(index=False).encode("utf-8"),
+                    file_name="consulta_estudiantes.csv",
+                    mime="text/csv",
+                )
+            except Exception as exc:
+                st.error(f"No fue posible ejecutar el explorador. Detalle: {exc}")
+
+            st.divider()
+            st.markdown("#### 2. Editor SQL")
+            example_name = st.selectbox("Consulta de ejemplo", list(EXAMPLE_QUERIES))
+            sql_text = st.text_area(
+                "Consulta (solo SELECT o WITH)",
+                value=EXAMPLE_QUERIES[example_name],
+                height=220,
+                key=f"sql_editor_{example_name}",
+            )
+            with st.expander("Columnas disponibles"):
+                try:
+                    schema, _ = run_query(
+                        db_path,
+                        f"SELECT name AS columna, type AS tipo FROM pragma_table_info('{TABLE}')",
+                    )
+                    st.dataframe(schema, hide_index=True, width="stretch")
+                except Exception as exc:
+                    st.error(f"No se pudo leer el esquema. Detalle: {exc}")
+
+            if st.button("▶️ Ejecutar consulta", type="primary"):
+                try:
+                    statement = validate_read_only_sql(sql_text)
+                    result, truncated = run_query(db_path, statement, (), EDITOR_MAX_ROWS)
+                    st.success(f"{len(result):,} filas devueltas.")
+                    if truncated:
+                        st.warning(f"Resultado limitado a las primeras {EDITOR_MAX_ROWS:,} filas.")
+                    st.dataframe(result, hide_index=True, width="stretch")
+                except Exception as exc:
+                    st.error(f"No se pudo ejecutar la consulta: {exc}")
 
 st.sidebar.divider()
