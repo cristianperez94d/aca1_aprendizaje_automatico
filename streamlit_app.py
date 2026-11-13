@@ -10,6 +10,7 @@ from pathlib import Path
 
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
@@ -30,7 +31,7 @@ DRIVE_CSV_URL = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}
 LOGISTIC_MODEL_PATH = APP_DIR / "modelo_logistico.pkl"
 TREE_MODEL_PATH = APP_DIR / "modelo_arbol.pkl"
 SCALER_PATH = APP_DIR / "scaler.pkl"
-MLP_MODEL_PATH = APP_DIR / "modelo_mlp.keras"
+MLP_WEIGHTS_PATH = APP_DIR / "modelo_mlp_pesos.npz"
 MLP_RESULTS_PATH = APP_DIR / "mlp_resultados.json"
 DB_FILENAME = "UCI_Predict_Students_Dropout.db"
 DB_PATH = APP_DIR / DB_FILENAME
@@ -116,6 +117,28 @@ def load_dataset() -> pd.DataFrame:
     return frame
 
 
+class NumpyMLP:
+    """Inferencia del MLP entrenado en Keras usando solo NumPy, sin TensorFlow."""
+
+    classes_ = np.array([0, 1])
+
+    def __init__(self, layers: list[tuple[np.ndarray, np.ndarray]]):
+        self.layers = layers
+        self.n_features_in_ = layers[0][0].shape[0]
+
+    def predict_proba(self, features) -> np.ndarray:
+        values = np.asarray(features, dtype=float)
+        for index, (weights, bias) in enumerate(self.layers):
+            values = values @ weights + bias
+            if index < len(self.layers) - 1:
+                values = np.maximum(values, 0.0)  # ReLU; el Dropout solo actúa al entrenar
+        exponentials = np.exp(values - values.max(axis=1, keepdims=True))
+        return exponentials / exponentials.sum(axis=1, keepdims=True)
+
+    def predict(self, features) -> np.ndarray:
+        return self.classes_[self.predict_proba(features).argmax(axis=1)]
+
+
 @st.cache_resource(show_spinner=False)
 def load_artifacts(
     signature: tuple[tuple[str, int | None, int | None], ...],
@@ -132,12 +155,13 @@ def load_artifacts(
             errors[model_name] = f"No se pudo cargar {model_path.name}: {exc}"
 
     try:
-        # TensorFlow se importa aquí para que la app funcione aunque no esté instalado
-        import keras
-
-        models[MLP_NAME] = keras.models.load_model(MLP_MODEL_PATH, compile=False)
+        with np.load(MLP_WEIGHTS_PATH) as archive:
+            layer_count = len(archive.files) // 2
+            models[MLP_NAME] = NumpyMLP(
+                [(archive[f"W{i}"], archive[f"b{i}"]) for i in range(1, layer_count + 1)]
+            )
     except Exception as exc:
-        errors[MLP_NAME] = f"No se pudo cargar {MLP_MODEL_PATH.name}: {exc}"
+        errors[MLP_NAME] = f"No se pudo cargar {MLP_WEIGHTS_PATH.name}: {exc}"
 
     try:
         scaler = joblib.load(SCALER_PATH)
@@ -165,7 +189,7 @@ def load_mlp_results() -> dict | None:
 
 def get_artifact_signature() -> tuple[tuple[str, int | None, int | None], ...]:
     """Genera una clave que cambia si aparece o se modifica algún artefacto."""
-    paths = [*MODEL_FILES.values(), MLP_MODEL_PATH, SCALER_PATH]
+    paths = [*MODEL_FILES.values(), MLP_WEIGHTS_PATH, SCALER_PATH]
     signature = []
     for path in paths:
         try:
@@ -184,10 +208,6 @@ def numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
 def validate_feature_schema(estimator: object, artifact_name: str) -> None:
     """Comprueba que el artefacto corresponde al esquema de nueve entradas."""
     feature_count = getattr(estimator, "n_features_in_", None)
-    if feature_count is None:
-        # Los modelos de Keras exponen la forma de entrada en lugar de n_features_in_
-        input_shape = getattr(estimator, "input_shape", None)
-        feature_count = input_shape[-1] if input_shape else None
     if feature_count is not None and feature_count != len(FEATURE_COLUMNS):
         raise ValueError(
             f"{artifact_name} fue entrenado con {feature_count} variables; "
@@ -932,8 +952,8 @@ with tab_predict:
         st.error(artifact_errors.get(selected_model_name, "El modelo seleccionado no está disponible."))
         st.info(
             "Ejecuta la celda de exportación del notebook para guardar "
-            "`modelo_logistico.pkl`, `modelo_arbol.pkl` y `modelo_mlp.keras` junto a "
-            "`streamlit_app.py`. La red neuronal también requiere `tensorflow`."
+            "`modelo_logistico.pkl`, `modelo_arbol.pkl` y `modelo_mlp_pesos.npz` junto a "
+            "`streamlit_app.py`."
         )
     if selected_model_name in SCALED_MODELS and loaded_scaler is None:
         st.error(artifact_errors.get("scaler", "El escalador no está disponible."))
@@ -1022,14 +1042,7 @@ with tab_predict:
                 else:
                     prediction_input = input_frame
 
-                graduate_probability = None
-                if selected_model_name == MLP_NAME:
-                    # Softmax: la posición 0 es Dropout y la 1 es Graduate
-                    probabilities = model.predict(prediction_input, verbose=0)[0]
-                    predicted_class = int(probabilities.argmax())
-                    graduate_probability = float(probabilities[1])
-                else:
-                    predicted_class = int(model.predict(prediction_input)[0])
+                predicted_class = int(model.predict(prediction_input)[0])
                 predicted_label = TARGET_LABELS.get(predicted_class)
                 if predicted_label is None:
                     raise ValueError(f"El modelo devolvió una clase inesperada: {predicted_class}.")
@@ -1049,7 +1062,7 @@ with tab_predict:
                         "académica."
                     )
 
-                if graduate_probability is None and hasattr(model, "predict_proba"):
+                if hasattr(model, "predict_proba"):
                     probabilities = model.predict_proba(prediction_input)[0]
                     classes = list(model.classes_)
                     graduate_probability = next(
@@ -1060,15 +1073,15 @@ with tab_predict:
                         ),
                         None,
                     )
-                if graduate_probability is not None:
-                    st.metric(
-                        "Probabilidad estimada de graduación",
-                        f"{graduate_probability:.1%}",
-                    )
-                    st.caption(
-                        "Probabilidad estimada por el modelo; no es una garantía "
-                        "del resultado individual."
-                    )
+                    if graduate_probability is not None:
+                        st.metric(
+                            "Probabilidad estimada de graduación",
+                            f"{graduate_probability:.1%}",
+                        )
+                        st.caption(
+                            "Probabilidad estimada por el modelo; no es una garantía "
+                            "del resultado individual."
+                        )
             except Exception as exc:
                 st.error(
                     "No fue posible generar la predicción. Verifica que los modelos "
