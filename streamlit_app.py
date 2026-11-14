@@ -17,7 +17,7 @@ import streamlit as st
 
 
 # -----------------------------------------------------------------------------
-# Configuración y constantes del proyecto
+# Configuración y constantes del proyecto 
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Predicción de deserción estudiantil | ACA Final",
