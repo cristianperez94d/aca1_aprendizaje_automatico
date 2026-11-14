@@ -1,4 +1,4 @@
-"""Aplicación ACA 1: análisis y predicción de deserción estudiantil."""
+"""Aplicación ACA Final: análisis y predicción de deserción estudiantil."""
 
 import json
 import re
@@ -20,7 +20,7 @@ import streamlit as st
 # Configuración y constantes del proyecto
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Predicción de deserción estudiantil | ACA 1",
+    page_title="Predicción de deserción estudiantil | ACA Final",
     page_icon="🎓",
     layout="wide",
 )
